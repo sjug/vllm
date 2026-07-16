@@ -78,6 +78,7 @@ def _process_b12x_weights(
     w2_scale_2: torch.Tensor,
 ) -> None:
     layer = SimpleNamespace(
+        w13_weight=torch.empty(0, device=w1_scale.device),
         w13_weight_scale=w1_scale,
         w13_weight_scale_2=w1_scale_2,
         w2_weight_scale=w2_scale,
@@ -109,14 +110,11 @@ def test_flashinfer_b12x_moe(
 
     Scale convention
     ----------------
-    The SM12x kernel uses ``w1_alpha`` as *both* the activation-quantisation
-    global scale and the weight dequantisation factor.  These two roles are
-    conflated into a single parameter in ``launch_sm120_moe``, so they must
-    equal the same value.  We use ``global_scale = 1.0`` for
-    ``fp4_quantize`` so that ``w1_alpha = ones`` satisfies both roles
-    simultaneously.  The alternative — vLLM's convention of baking a large
-    ``w_gs`` into block-scale values and compensating with
-    ``g1_alphas = 1/w_gs`` — is incompatible with this kernel.
+    NVFP4 checkpoints store each weight's FP32 global scale separately from
+    its E4M3 per-block scales. The SM12x kernel receives the global scale as
+    ``w1_alpha`` / ``w2_alpha`` and uses a separate value of 1.0 for dynamic
+    activation quantization. The adapter must preserve both checkpoint scale
+    representations instead of baking the FP32 value into E4M3 block scales.
     """
     set_random_seed(7)
     with set_current_vllm_config(
@@ -130,16 +128,28 @@ def test_flashinfer_b12x_moe(
         w2_bf16 = torch.randn((e, k, n), device="cuda", dtype=dtype) / 15
 
         # ------------------------------------------------------------------ #
-        # Quantise weights for the SM12x kernel using FlashInfer's convention:
-        #   global_scale = 1.0   →   block_scale = max_abs_block / fp4_max
-        #   w1_alpha = 1.0       (no extra global factor to compensate)
+        # Quantise weights with the two-scale convention used by NVFP4
+        # checkpoints. The E4M3 block scales describe locally quantized values,
+        # while the FP32 weight_scale_2 restores the tensor-wide magnitude.
         #
         # The scale factors returned by fp4_quantize(..., is_sf_swizzled_layout=True)
         # are already in the swizzled 2D layout expected by convert_sf_to_mma_layout.
         # No additional swizzle_blockscale() call is needed.
         # ------------------------------------------------------------------ #
-        gs = torch.ones(1, device="cuda", dtype=torch.float32)
         sf_vec_size = 16
+
+        fp4_max = 6.0
+        e4m3_max = 448.0
+        w1_scale_2_scalar = w1_bf16.float().abs().amax().reshape(1) / (
+            e4m3_max * fp4_max
+        )
+        w2_scale_2_scalar = w2_bf16.float().abs().amax().reshape(1) / (
+            e4m3_max * fp4_max
+        )
+        w1_scale_2 = w1_scale_2_scalar.expand(e).clone()
+        w2_scale_2 = w2_scale_2_scalar.expand(e).clone()
+        w1_global_scale = (1.0 / w1_scale_2_scalar).contiguous()
+        w2_global_scale = (1.0 / w2_scale_2_scalar).contiguous()
 
         # W1: reorder BF16 from [gate, up] → [up, gate], then quantise.
         w1_reordered = torch.cat(
@@ -148,7 +158,7 @@ def test_flashinfer_b12x_moe(
         w1_flat = w1_reordered.reshape(e * 2 * n, k)
         w1_q_flat, w1_sf_flat = fp4_quantize(
             w1_flat,
-            global_scale=gs,
+            global_scale=w1_global_scale,
             sf_vec_size=sf_vec_size,
             is_sf_swizzled_layout=True,
         )
@@ -159,19 +169,18 @@ def test_flashinfer_b12x_moe(
         w2_flat = w2_bf16.reshape(e * k, n)
         w2_q_flat, w2_sf_flat = fp4_quantize(
             w2_flat,
-            global_scale=gs,
+            global_scale=w2_global_scale,
             sf_vec_size=sf_vec_size,
             is_sf_swizzled_layout=True,
         )
         w2_q = w2_q_flat.view(e, k, n // 2)  # uint8, packed FP4
         w2_blockscale = w2_sf_flat.view(e, k, w2_sf_flat.shape[1])  # float8
 
-        # All per-expert alphas are 1.0 (global_scale = 1.0, no compensation).
         ones_e = torch.ones(e, device="cuda", dtype=torch.float32)
 
         quant_config = nvfp4_moe_quant_config(
-            g1_alphas=ones_e,
-            g2_alphas=ones_e,
+            g1_alphas=w1_scale_2,
+            g2_alphas=w2_scale_2,
             a1_gscale=ones_e,
             a2_gscale=ones_e,
             w1_scale=w1_blockscale,
@@ -190,13 +199,31 @@ def test_flashinfer_b12x_moe(
             moe_config=moe_config,
             quant_config=quant_config,
         )
+
+        # Regression guard: weight_scale_2 must remain in FP32. Baking it into
+        # E4M3 block scales loses precision and was the source of #48536.
+        w1_blockscale_before = w1_blockscale.view(torch.uint8).clone()
+        w2_blockscale_before = w2_blockscale.view(torch.uint8).clone()
+        w1_scale_2_before = w1_scale_2.clone()
+        w2_scale_2_before = w2_scale_2.clone()
+
         _process_b12x_weights(
             experts,
             w1_blockscale,
             w2_blockscale,
-            ones_e,
-            ones_e,
+            w1_scale_2,
+            w2_scale_2,
         )
+
+        assert torch.equal(w1_blockscale.view(torch.uint8), w1_blockscale_before)
+        assert torch.equal(w2_blockscale.view(torch.uint8), w2_blockscale_before)
+        assert torch.equal(w1_scale_2, w1_scale_2_before)
+        assert torch.equal(w2_scale_2, w2_scale_2_before)
+        assert experts._fc1_input_gs is not None
+        assert experts._fc1_input_gs.dtype == torch.float32
+        assert experts._fc1_input_gs.shape == (e,)
+        assert experts._fc1_input_gs.is_contiguous()
+        assert torch.equal(experts._fc1_input_gs, ones_e)
 
         kernel = mk.FusedMoEKernel(
             maybe_make_prepare_finalize(
