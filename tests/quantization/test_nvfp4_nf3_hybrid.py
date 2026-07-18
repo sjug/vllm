@@ -7,9 +7,12 @@ import torch
 from vllm.config.quantization import resolve_quantization_config
 from vllm.model_executor.layers.quantization import get_quantization_config
 from vllm.model_executor.layers.quantization.nvfp4_nf3_hybrid import (
+    _GRID48_PROFILE,
+    _GRID188_PROFILE,
     NvFp4Nf3HybridConfig,
     _combined_tier_local_descriptors,
     _read_hybrid_keys,
+    _select_mapped_grid_profile,
     _unpack_nf3_codes,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp8Dynamic
@@ -109,3 +112,28 @@ def test_grid188_tier_descriptors_encode_exact_partition():
 def test_grid188_tier_descriptors_reject_incomplete_partition():
     with pytest.raises(ValueError, match="does not cover all 256"):
         _combined_tier_local_descriptors({0: (0, 0)})
+
+
+@pytest.mark.parametrize(
+    ("capability", "sms", "expected"),
+    [
+        ((12, 0), 188, _GRID188_PROFILE),
+        ((12, 1), 48, _GRID48_PROFILE),
+    ],
+)
+def test_mapped_grid_profile_requires_exact_supported_device(capability, sms, expected):
+    assert _select_mapped_grid_profile(capability, sms) == expected
+
+
+@pytest.mark.parametrize(
+    ("capability", "sms"),
+    [
+        ((12, 0), 48),
+        ((12, 1), 188),
+        ((12, 1), 47),
+        ((12, 2), 48),
+    ],
+)
+def test_mapped_grid_profile_rejects_partial_matches(capability, sms):
+    with pytest.raises(RuntimeError, match="exact SM120/188 or SM121/48"):
+        _select_mapped_grid_profile(capability, sms)

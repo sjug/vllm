@@ -67,20 +67,45 @@ _NF3_GLOBAL_SCALE = 2.0**116
 # Expert-chunk size for NF3 unpack/repack (bounds transient VRAM: the int32
 # code planes are ~400 MB per 16 w13 experts at GLM-5.2 shapes).
 _NF3_PACK_CHUNK = 16
-# Exact one-grid decode specialization published for the TP4 hybrid checkpoint.
-_GRID188_M = 4
-_GRID188_TOPK = 8
-_GRID188_HIDDEN = 6144
-_GRID188_INTERMEDIATE = 512
-_GRID188_NUM_KEPT = 64
-_GRID188_NUM_NF3 = 192
+# Exact mapped one-grid decode geometry for the TP4 hybrid checkpoint.
+_MAPPED_GRID_M = 4
+_MAPPED_GRID_TOPK = 8
+_MAPPED_GRID_HIDDEN = 6144
+_MAPPED_GRID_INTERMEDIATE = 512
+_MAPPED_GRID_NUM_KEPT = 64
+_MAPPED_GRID_NUM_NF3 = 192
+
+
+@dataclasses.dataclass(frozen=True)
+class _MappedGridProfile:
+    name: str
+    capability: tuple[int, int]
+    sms: int
+    grid_x: int
+
+
+_GRID188_PROFILE = _MappedGridProfile("Grid188", (12, 0), 188, 188)
+_GRID48_PROFILE = _MappedGridProfile("Grid48", (12, 1), 48, 48)
+
+
+def _select_mapped_grid_profile(
+    capability: tuple[int, int], sms: int
+) -> _MappedGridProfile:
+    """Select only a mapped-grid profile proven for the exact device."""
+    for profile in (_GRID188_PROFILE, _GRID48_PROFILE):
+        if capability == profile.capability and int(sms) == profile.sms:
+            return profile
+    raise RuntimeError(
+        "mapped one-grid decode requires exact SM120/188 or SM121/48, got "
+        f"SM{capability[0]}{capability[1]}/{int(sms)}"
+    )
 
 
 def _combined_tier_local_descriptors(
     remap: dict[int, tuple[int, int]],
 ) -> list[int]:
-    """Encode an exact E64/E192 partition for the mapped Grid188 kernel."""
-    descriptors = [-1] * (_GRID188_NUM_KEPT + _GRID188_NUM_NF3)
+    """Encode an exact E64/E192 partition for a mapped-grid kernel."""
+    descriptors = [-1] * (_MAPPED_GRID_NUM_KEPT + _MAPPED_GRID_NUM_NF3)
     seen_local = (set(), set())
     for global_id, tier_local in remap.items():
         try:
@@ -94,7 +119,11 @@ def _combined_tier_local_descriptors(
         if descriptors[global_id_i] != -1:
             raise ValueError(f"duplicate global expert ID {global_id_i}")
         local_limit = (
-            _GRID188_NUM_KEPT if tier_i == 0 else _GRID188_NUM_NF3 if tier_i == 1 else 0
+            _MAPPED_GRID_NUM_KEPT
+            if tier_i == 0
+            else _MAPPED_GRID_NUM_NF3
+            if tier_i == 1
+            else 0
         )
         if (
             tier_i != tier
@@ -111,14 +140,14 @@ def _combined_tier_local_descriptors(
         descriptors[global_id_i] = local_id_i if tier_i == 0 else 0x100 | local_id_i
     if any(descriptor < 0 for descriptor in descriptors):
         raise ValueError("heterogeneous remap does not cover all 256 global experts")
-    if seen_local[0] != set(range(_GRID188_NUM_KEPT)) or seen_local[1] != set(
-        range(_GRID188_NUM_NF3)
+    if seen_local[0] != set(range(_MAPPED_GRID_NUM_KEPT)) or seen_local[1] != set(
+        range(_MAPPED_GRID_NUM_NF3)
     ):
         raise ValueError("heterogeneous remap is not a complete E64/E192 partition")
     return descriptors
 
 
-def _is_grid188_geometry(
+def _is_mapped_grid_geometry(
     *,
     hidden_size: int,
     intermediate_size: int,
@@ -129,14 +158,14 @@ def _is_grid188_geometry(
     kept_mx: bool,
 ) -> bool:
     return (
-        envs.VLLM_NF3_GRID188_DECODE
+        envs.VLLM_NF3_MAPPED_GRID_DECODE
         and not kept_mx
-        and hidden_size == _GRID188_HIDDEN
-        and intermediate_size == _GRID188_INTERMEDIATE
-        and num_experts == _GRID188_NUM_KEPT + _GRID188_NUM_NF3
-        and num_kept == _GRID188_NUM_KEPT
-        and num_nf3 == _GRID188_NUM_NF3
-        and topk == _GRID188_TOPK
+        and hidden_size == _MAPPED_GRID_HIDDEN
+        and intermediate_size == _MAPPED_GRID_INTERMEDIATE
+        and num_experts == _MAPPED_GRID_NUM_KEPT + _MAPPED_GRID_NUM_NF3
+        and num_kept == _MAPPED_GRID_NUM_KEPT
+        and num_nf3 == _MAPPED_GRID_NUM_NF3
+        and topk == _MAPPED_GRID_TOPK
     )
 
 
@@ -186,11 +215,12 @@ class _HybridSharedRuntime:
         self.buffers: Any = None
         self.out_kept: torch.Tensor | None = None
         self.out_nf3: torch.Tensor | None = None
-        self.grid188_launch: Any = None
-        self.grid188_scratch: dict[str, torch.Tensor] | None = None
-        self.grid188_sms: int | None = None
-        self.grid188_max_shared_mem: int | None = None
-        self.grid188_disabled_reason: str | None = None
+        self.mapped_grid_launch: Any = None
+        self.mapped_grid_scratch: dict[str, torch.Tensor] | None = None
+        self.mapped_grid_sms: int | None = None
+        self.mapped_grid_max_shared_mem: int | None = None
+        self.mapped_grid_profile: _MappedGridProfile | None = None
+        self.mapped_grid_disabled_reason: str | None = None
 
 
 class _HybridLayerState:
@@ -228,10 +258,10 @@ class _HybridLayerState:
         self.kept_module: torch.nn.Module | None = None
         self.kept_remap: torch.Tensor | None = None
         # Exact TP4 E64-NVFP4/E192-NF3 one-grid decode resources.
-        self.grid188_weight_views: tuple[torch.Tensor, ...] | None = None
-        self.grid188_tier_map: torch.Tensor | None = None
-        self.grid188_output: torch.Tensor | None = None
-        self.grid188_ready = False
+        self.mapped_grid_weight_views: tuple[torch.Tensor, ...] | None = None
+        self.mapped_grid_tier_map: torch.Tensor | None = None
+        self.mapped_grid_output: torch.Tensor | None = None
+        self.mapped_grid_ready = False
         # Keeps kernel-format tensors alive: b12x prepared weights VIEW the
         # converted tensors, so dropping them would dangle the views.
         self.keepalive: Any = None
@@ -816,7 +846,7 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
         return runtime.launches[key]
 
     @staticmethod
-    def _grid188_prepared_views(prepared: Any) -> tuple[torch.Tensor, ...]:
+    def _mapped_grid_prepared_views(prepared: Any) -> tuple[torch.Tensor, ...]:
         return (
             prepared.w13.view(torch.int32).view(-1),
             prepared.w2.view(torch.int32).view(-1),
@@ -827,7 +857,7 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
         )
 
     @staticmethod
-    def _borrow_grid188_scratch(
+    def _borrow_mapped_grid_scratch(
         buffers: Any,
         *,
         device: torch.device,
@@ -858,11 +888,11 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
                 or source.data_ptr() % 16
             ):
                 raise RuntimeError(
-                    f"Grid188 scratch source {source_name} failed admission"
+                    f"mapped-grid scratch source {source_name} failed admission"
                 )
             storage_id = int(source.untyped_storage().data_ptr())
             if storage_id in storage_ids:
-                raise RuntimeError("Grid188 scratch sources alias each other")
+                raise RuntimeError("mapped-grid scratch sources alias each other")
             storage_ids.add(storage_id)
             borrowed[target_name] = source.view(-1)[:elements].view(shape)
         borrowed["workspace"] = torch.zeros(
@@ -870,13 +900,13 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
         )
         return borrowed
 
-    def _prepare_grid188(self, layer: "RoutedExperts", topk: int) -> None:
-        """Arm the exact NF3 Grid188 path during the eager profile forward."""
+    def _prepare_mapped_grid(self, layer: "RoutedExperts", topk: int) -> None:
+        """Arm the exact device-shaped path during the eager profile forward."""
         state: _HybridLayerState = layer.hybrid_state
         runtime = self.quant_config.shared_runtime
-        if state.grid188_ready or runtime.grid188_disabled_reason is not None:
+        if state.mapped_grid_ready or runtime.mapped_grid_disabled_reason is not None:
             return
-        if not _is_grid188_geometry(
+        if not _is_mapped_grid_geometry(
             hidden_size=state.hidden_size,
             intermediate_size=state.intermediate_size,
             num_experts=state.num_experts,
@@ -887,42 +917,51 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
         ):
             return
         if torch.cuda.is_current_stream_capturing():
-            runtime.grid188_disabled_reason = (
+            runtime.mapped_grid_disabled_reason = (
                 "resources were not prepared before capture"
             )
             return
         try:
+            props = torch.cuda.get_device_properties(torch.cuda.current_device())
+            sms = int(props.multi_processor_count)
+            profile = _select_mapped_grid_profile(
+                (int(props.major), int(props.minor)), sms
+            )
             prep_kept, prep_nf3 = state.prep_kept, state.prep_nf3
             if prep_kept is None or prep_nf3 is None:
                 raise RuntimeError("both prepared tiers are required")
             prepared_contract = (
                 prep_kept.weight_layout == "packed"
                 and prep_kept.scale_format == "e4m3_k16"
-                and int(prep_kept.num_experts) == _GRID188_NUM_KEPT
+                and int(prep_kept.num_experts) == _MAPPED_GRID_NUM_KEPT
                 and prep_nf3.weight_layout == "nf3_2p1"
                 and prep_nf3.scale_format == "e4m3_k32"
-                and int(prep_nf3.num_experts) == _GRID188_NUM_NF3
+                and int(prep_nf3.num_experts) == _MAPPED_GRID_NUM_NF3
             )
             if not prepared_contract:
-                raise RuntimeError("prepared tier layouts do not match Grid188 ABI")
+                raise RuntimeError("prepared tier layouts do not match mapped-grid ABI")
 
-            props = torch.cuda.get_device_properties(torch.cuda.current_device())
-            sms = int(props.multi_processor_count)
             max_shared_mem = int(
                 getattr(props, "shared_memory_per_block_optin", 101_376)
             )
-            if runtime.grid188_launch is None:
+            if runtime.mapped_grid_launch is None:
                 from b12x.moe.fused.w4a16.kernel import (
+                    compile_w4a16_hybrid_mapped_grid48,
                     compile_w4a16_hybrid_mapped_grid188,
                 )
 
-                launch = compile_w4a16_hybrid_mapped_grid188(
-                    size_m=_GRID188_M,
-                    hidden_size=_GRID188_HIDDEN,
-                    intermediate_size=_GRID188_INTERMEDIATE,
-                    nv_num_experts=_GRID188_NUM_KEPT,
-                    nf_num_experts=_GRID188_NUM_NF3,
-                    top_k=_GRID188_TOPK,
+                compile_mapped_grid = (
+                    compile_w4a16_hybrid_mapped_grid188
+                    if profile is _GRID188_PROFILE
+                    else compile_w4a16_hybrid_mapped_grid48
+                )
+                launch = compile_mapped_grid(
+                    size_m=_MAPPED_GRID_M,
+                    hidden_size=_MAPPED_GRID_HIDDEN,
+                    intermediate_size=_MAPPED_GRID_INTERMEDIATE,
+                    nv_num_experts=_MAPPED_GRID_NUM_KEPT,
+                    nf_num_experts=_MAPPED_GRID_NUM_NF3,
+                    top_k=_MAPPED_GRID_TOPK,
                     activation="silu",
                     element_dtype="bf16",
                     fast_math=True,
@@ -931,29 +970,37 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
                     force_tile_config=_B12X_TILES,
                 )
                 if (
-                    int(launch.grid_x) != 188
+                    int(launch.grid_x) != profile.grid_x
                     or int(launch.blocks_per_sm) != 1
-                    or int(launch.size_m) != _GRID188_M
+                    or int(launch.size_m) != _MAPPED_GRID_M
                     or int(launch.shared_memory_bytes) != 45_184
-                    or int(launch.route_slots) != _GRID188_M * _GRID188_TOPK
-                    or int(launch.map_slots) != _GRID188_NUM_KEPT + _GRID188_NUM_NF3
+                    or int(launch.route_slots) != _MAPPED_GRID_M * _MAPPED_GRID_TOPK
+                    or int(launch.map_slots)
+                    != _MAPPED_GRID_NUM_KEPT + _MAPPED_GRID_NUM_NF3
                 ):
-                    raise RuntimeError("compiled Grid188 launch failed admission")
+                    raise RuntimeError(
+                        f"compiled {profile.name} launch failed admission"
+                    )
                 if not hasattr(torch.ops.b12x, "w4a16_hybrid_mapped_grid188_launch"):
-                    raise RuntimeError("Grid188 custom op is unavailable")
-                runtime.grid188_scratch = self._borrow_grid188_scratch(
+                    raise RuntimeError("mapped-grid custom op is unavailable")
+                runtime.mapped_grid_scratch = self._borrow_mapped_grid_scratch(
                     runtime.buffers,
                     device=prep_kept.w13.device,
                     scratch_elements=int(launch.scratch_elements),
                     workspace_words=int(launch.workspace_words),
                 )
-                runtime.grid188_sms = sms
-                runtime.grid188_max_shared_mem = max_shared_mem
-                runtime.grid188_launch = launch
+                runtime.mapped_grid_sms = sms
+                runtime.mapped_grid_max_shared_mem = max_shared_mem
+                runtime.mapped_grid_profile = profile
+                runtime.mapped_grid_launch = launch
+            elif runtime.mapped_grid_profile != profile:
+                raise RuntimeError(
+                    "shared mapped-grid runtime was prepared for a different device"
+                )
 
             weight_views = (
-                *self._grid188_prepared_views(prep_kept),
-                *self._grid188_prepared_views(prep_nf3),
+                *self._mapped_grid_prepared_views(prep_kept),
+                *self._mapped_grid_prepared_views(prep_nf3),
             )
             tier_map = torch.tensor(
                 _combined_tier_local_descriptors(state.remap),
@@ -961,26 +1008,28 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
                 device=prep_kept.w13.device,
             ).contiguous()
             output = torch.empty(
-                (_GRID188_M, _GRID188_HIDDEN),
+                (_MAPPED_GRID_M, _MAPPED_GRID_HIDDEN),
                 dtype=torch.bfloat16,
                 device=prep_kept.w13.device,
             )
             # Publish only after every allocation and validation has succeeded.
-            state.grid188_weight_views = weight_views
-            state.grid188_tier_map = tier_map
-            state.grid188_output = output
-            state.grid188_ready = True
+            state.mapped_grid_weight_views = weight_views
+            state.mapped_grid_tier_map = tier_map
+            state.mapped_grid_output = output
+            state.mapped_grid_ready = True
             logger.info_once(
-                "nvfp4_nf3_hybrid: armed exact TP4 Grid188 one-grid decode"
+                "nvfp4_nf3_hybrid: armed exact TP4 %s one-grid decode",
+                profile.name,
             )
         except Exception as exc:
-            runtime.grid188_disabled_reason = f"{type(exc).__name__}: {exc}"
+            runtime.mapped_grid_disabled_reason = f"{type(exc).__name__}: {exc}"
             logger.warning_once(
-                "nvfp4_nf3_hybrid: Grid188 unavailable; using serial decode: %s",
-                runtime.grid188_disabled_reason,
+                "nvfp4_nf3_hybrid: mapped one-grid decode unavailable; "
+                "using serial decode: %s",
+                runtime.mapped_grid_disabled_reason,
             )
 
-    def _run_grid188(
+    def _run_mapped_grid(
         self,
         layer: "RoutedExperts",
         x: torch.Tensor,
@@ -989,27 +1038,27 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
     ) -> torch.Tensor:
         state: _HybridLayerState = layer.hybrid_state
         runtime = self.quant_config.shared_runtime
-        launch = runtime.grid188_launch
-        scratch = runtime.grid188_scratch
+        launch = runtime.mapped_grid_launch
+        scratch = runtime.mapped_grid_scratch
         assert launch is not None and scratch is not None
-        assert runtime.grid188_sms is not None
-        assert runtime.grid188_max_shared_mem is not None
-        assert state.grid188_weight_views is not None
-        assert state.grid188_tier_map is not None
-        assert state.grid188_output is not None
+        assert runtime.mapped_grid_sms is not None
+        assert runtime.mapped_grid_max_shared_mem is not None
+        assert state.mapped_grid_weight_views is not None
+        assert state.mapped_grid_tier_map is not None
+        assert state.mapped_grid_output is not None
         torch.ops.b12x.w4a16_hybrid_mapped_grid188_launch(
             x,
-            *state.grid188_weight_views,
+            *state.mapped_grid_weight_views,
             topk_ids,
-            state.grid188_tier_map,
+            state.mapped_grid_tier_map,
             scratch["fc1"],
             scratch["activated"],
-            state.grid188_output,
+            state.mapped_grid_output,
             topk_weights,
             scratch["fc1_c_tmp"],
             scratch["fc2_c_tmp"],
             scratch["workspace"],
-            _GRID188_M,
+            _MAPPED_GRID_M,
             int(launch.size_m),
             int(launch.hidden_size),
             int(launch.intermediate_size),
@@ -1019,8 +1068,8 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
             launch.activation,
             launch.element_dtype,
             bool(launch.fast_math),
-            runtime.grid188_sms,
-            runtime.grid188_max_shared_mem,
+            runtime.mapped_grid_sms,
+            runtime.mapped_grid_max_shared_mem,
             int(launch.fc1_tile_k),
             int(launch.fc1_tile_n),
             int(launch.fc2_tile_k),
@@ -1028,7 +1077,7 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
             int(launch.grid_x),
             int(torch.cuda.current_stream(x.device).cuda_stream),
         )
-        return state.grid188_output
+        return state.mapped_grid_output
 
     def _ensure_runtime(self, layer: "RoutedExperts", m: int, topk: int) -> None:
         """First-apply init: per-tier preplanned launches plus ONE shared
@@ -1094,7 +1143,7 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
             # them, so sharing them across layers is safe.
             runtime.out_kept = buffers.output
             runtime.out_nf3 = torch.empty_like(buffers.output)
-        self._prepare_grid188(layer, topk)
+        self._prepare_mapped_grid(layer, topk)
         state.runtime_ready = True
 
     def _run_tier(
@@ -1216,7 +1265,7 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
         )
         if not weights.is_contiguous():
             weights = weights.contiguous()
-        if state.grid188_ready and m == _GRID188_M:
+        if state.mapped_grid_ready and m == _MAPPED_GRID_M:
             grid_ids = (
                 topk_ids if topk_ids.dtype == torch.int32 else topk_ids.to(torch.int32)
             )
@@ -1225,16 +1274,18 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
             if (
                 x.dtype == torch.bfloat16
                 and x.is_contiguous()
-                and grid_ids.numel() == _GRID188_M * _GRID188_TOPK
+                and grid_ids.numel() == _MAPPED_GRID_M * _MAPPED_GRID_TOPK
                 and grid_ids.is_cuda
                 and grid_ids.device == x.device
                 and grid_ids.data_ptr() % 16 == 0
-                and weights.numel() == _GRID188_M * _GRID188_TOPK
+                and weights.numel() == _MAPPED_GRID_M * _MAPPED_GRID_TOPK
             ):
+                assert runtime.mapped_grid_profile is not None
                 logger.info_once(
-                    "nvfp4_nf3_hybrid: executing TP4 Grid188 one-grid decode"
+                    "nvfp4_nf3_hybrid: executing TP4 %s one-grid decode",
+                    runtime.mapped_grid_profile.name,
                 )
-                return self._run_grid188(layer, x, weights, grid_ids)
+                return self._run_mapped_grid(layer, x, weights, grid_ids)
         if state.num_nf3 == 0:
             # Uniform-NVFP4 layer (e.g. MTP head): single-tier launch.
             output = torch.empty((m, state.hidden_size), dtype=x.dtype, device=x.device)
